@@ -1,5 +1,6 @@
 mcp>=1.29,<2
 openpyxl>=3.1,<4
 Pillow>=11,<13
-scipy>=1.11,<2
+numpy>=1.26,<3
+scipy>=1.12,<2
 matplotlib>=3.8,<4

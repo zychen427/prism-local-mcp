@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse,ctypes as c,json,os,re,time
 from ctypes import wintypes as w
 from pathlib import Path
+from prism_version import process_image
 
 def native_user32():
  u=c.WinDLL('user32',use_last_error=True)
@@ -42,15 +43,21 @@ class PrismBridge:
   out=[];callback=c.WINFUNCTYPE(w.BOOL,w.HWND,w.LPARAM)
   @callback
   def visit(h,_):
-   if self.cls(h).startswith('IPMainClass') and 'GraphPad Prism' in self.text(h):out.append({'hwnd':int(h),'title':self.text(h),'pid':self.pid_of(h)})
+   if self.is_prism_frame(h):out.append({'hwnd':int(h),'title':self.text(h),'pid':self.pid_of(h)})
    return True
   self.u.EnumWindows(visit,0);return out
+ def is_prism_frame(self,h):
+  title=self.text(h);cls=self.cls(h)
+  if 'graphpad prism' not in title.casefold() or cls=='#32770':return False
+  if cls.startswith('IPMainClass'):return True
+  path=process_image(self.pid_of(h))
+  return bool(path and Path(path).name.casefold().startswith('prism') and Path(path).suffix.casefold()=='.exe')
  @classmethod
  def discover(cls):
   if os.name!='nt':return []
   obj=cls.__new__(cls);obj.u=native_user32();return obj.windows()
  def validate(self):
-  if not self.u.IsWindow(self.frame) or self.pid_of(self.frame)!=self.pid or not self.cls(self.frame).startswith('IPMainClass'):raise RuntimeError('Session window was closed/reused; reconnect explicitly.')
+  if not self.u.IsWindow(self.frame) or self.pid_of(self.frame)!=self.pid or not self.is_prism_frame(self.frame):raise RuntimeError('Session window was closed/reused; reconnect explicitly.')
   current=self.text(self.frame)
   if current!=self.initial_title:
    def identity(title):
@@ -123,7 +130,9 @@ class PrismBridge:
    return True
   self.u.EnumChildWindows(h,visit,0);return out
  def read(self,h):
-  self.guard(h);b=c.create_unicode_buffer(4096);self.send(h,0xD,len(b),c.addressof(b));return b.value
+  self.guard(h);length=self.send(h,0xE)
+  if length<0 or length>2000000:raise RuntimeError('Unexpected control text length; inspect the dialog before continuing.')
+  b=c.create_unicode_buffer(max(4096,length+1));self.send(h,0xD,len(b),c.addressof(b));return b.value
  def dialogs(self):
   out=[];callback=c.WINFUNCTYPE(w.BOOL,w.HWND,w.LPARAM)
   @callback
@@ -229,12 +238,10 @@ class PrismBridge:
     if len(choices)==1:return choices[0]
     if len(choices)>1:raise RuntimeError('Multiple script dialogs: inspect state explicitly.')
     time.sleep(.15)
-   raise RuntimeError('Script dialog did not appear for this UI language/version; use current UI discovery or GUI fallback.')
+   phase='file-open' if file_open else 'loaded-script'
+   raise RuntimeError(f'Prism script dialog not discovered during {phase}; the script may already be loaded but has not been confirmed as run. Inspect the visible dialog and log for {path}; do not rerun a mutating script blindly, especially with multiple Prism windows.')
   dialog=wait_script_dialog(True);edit=self.control(dialog['hwnd'],1148,'Edit');buf=c.create_unicode_buffer(str(path));self.send(edit,0xC,0,c.addressof(buf))
-  existing=set(self._script_windows())
-  self.button(self.control(dialog['hwnd'],1,'Button'))
-  # Some Prism builds create the editor as an ownerless top-level window.
-  # Adopt only a new, unique editor displaying the exact just-opened script path.
+  existing=set(self._script_windows());self.button(self.control(dialog['hwnd'],1,'Button'))
   deadline=time.monotonic()+5;candidates=[]
   while time.monotonic()<deadline:
    candidates=[h for h in self._script_windows() if h not in existing and self._script_dialog_matches(h,path)]
@@ -244,18 +251,21 @@ class PrismBridge:
   elif len(candidates)>1:raise RuntimeError('Multiple matching new script dialogs; refusing to choose one.')
   script=wait_script_dialog(False);run=[x for x in script['controls'] if x['class']=='Button' and x['enabled'] and re.fullmatch(r'\s*(?:运行|run)\s*(?:\([^)]*\))?\s*',x['text'],re.I)]
   if len(run)!=1:raise RuntimeError('Cannot uniquely identify Run button; inspect current script dialog.')
-  # Prism may decode a UTF-8 BOM as local-codepage characters after Save As.
-  # Compare the displayed script to the authorized source before any command runs.
   editors=[x for x in script['controls'] if x['class']=='Edit' and x['id']==1914]
   if len(editors)!=1:raise RuntimeError('Cannot inspect the loaded script editor; refusing to run unverified commands.')
   expected=data.decode('utf-8-sig').replace('\r\n','\n').replace('\r','\n')
   displayed=self.read(editors[0]['hwnd']).lstrip('\ufeff').replace('\r\n','\n').replace('\r','\n')
   corrected=displayed!=expected
   if corrected:
-   self.edit(editors[0]['hwnd'],expected.replace('\n','\r\n'))
+   # The uniquely owned editor was just discovered and read above. Replace its
+   # contents directly rather than clicking an editor that may be off-screen or
+   # covered by another window. The following readback remains mandatory.
+   replacement=c.create_unicode_buffer(expected.replace('\n','\r\n'))
+   self.send(editors[0]['hwnd'],0xB1,0,-1)  # EM_SETSEL
+   self.send(editors[0]['hwnd'],0xC2,1,c.addressof(replacement))  # EM_REPLACESEL; emits EN_CHANGE
    actual=self.read(editors[0]['hwnd']).lstrip('\ufeff').replace('\r\n','\n').replace('\r','\n')
    if actual!=expected:raise RuntimeError('Loaded script text differs from the requested script after correction; no commands were run.')
-  log=path.with_suffix('.log');previous=log.stat().st_mtime_ns if log.exists() else None;self.button(run[0]['hwnd']);deadline=time.monotonic()+50;status='pending';txt=None
+  log=path.with_suffix('.log');previous=log.stat().st_mtime_ns if log.exists() else None;self.button(run[0]['hwnd']);deadline=time.monotonic()+50;status='pending';txt=None;closed_at=None
   while time.monotonic()<deadline:
    if log.exists() and log.stat().st_mtime_ns!=previous:
     raw=log.read_bytes();txt=None
@@ -265,14 +275,14 @@ class PrismBridge:
     txt=txt or raw.decode('utf8',errors='replace')
     if '发生问题' in txt or '已停止' in txt or '由于出错' in txt:status='error';break
     if '完成!' in txt or 'Completed' in txt or 'Finished' in txt:status='completed';break
-   if not self.u.IsWindow(script['hwnd']):status='closed';break
+   if not self.u.IsWindow(script['hwnd']):
+    if closed_at is None:closed_at=time.monotonic()
+    if time.monotonic()-closed_at>=3:status='closed';break
    time.sleep(.2)
   # Save As can legitimately rename this same frame. Update only after this submitted script.
   self.initial_title=self.text(self.frame)
   result={'status':status,'log':str(log),'log_text':txt if log.exists() else None,'script_dialog_adopted':bool(candidates),'script_text_corrected':corrected,'dialogs':[{'hwnd':d['hwnd'],'title':d['title']} for d in self.dialogs()]}
   if status!='completed':
-   # Only a confirmed failed script may be dismissed, and only when its
-   # exact path and freshly adopted window still match. Never close unknown UI.
    if status=='error' and script['hwnd'] in self._script_dialogs and self._script_dialog_matches(script['hwnd'],path):
     try:
      close=self.control(script['hwnd'],2,'Button');self.button(close,script['hwnd']);result['owned_error_dialog_closed']=True;result['dialogs']=[{'hwnd':d['hwnd'],'title':d['title']} for d in self.dialogs()]

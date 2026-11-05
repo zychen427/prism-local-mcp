@@ -1,8 +1,9 @@
 """Prism-native IC20 workflow using the verified Prism 11 template only."""
 from pathlib import Path
-import csv,hashlib,io,json,math,zipfile,tempfile,shutil
+import csv,hashlib,io,json,math,zipfile,tempfile,shutil,time
 from prism_project import inspect,write_script,quote
 from prism_dose_advanced import analyze
+from prism_graph_preflight import preflight
 
 VERIFIED_TEMPLATE_SHA256='d86403b27b774bc0c424b394f6f119ed4d50cd335dc08127a3fdb29ca240d777'
 
@@ -13,6 +14,7 @@ def file_hash(path):
  return h.hexdigest()
 
 def native_ic20(bridge,output_dir,template_file,points,name='IC20_native'):
+ started=time.perf_counter()
  root=Path(output_dir).resolve();source=Path(template_file).resolve()
  asset=Path(__file__).resolve().parents[1]/'assets'/'ic20_template_prism11.prism'
  if not name or any(ch not in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-' for ch in name):raise ValueError('name must contain only ASCII letters, digits, hyphen or underscore')
@@ -42,7 +44,7 @@ def native_ic20(bridge,output_dir,template_file,points,name='IC20_native'):
  staged_project=stage/(stage.name+'.prism');staged_data=stage/'input.tsv';staged_graph=stage/'graph.png'
  journal={'state':'prepared','stage_dir':str(stage),'template':str(source),'outputs':{k:str(v) for k,v in paths.items()},'warning':'Do not retry a started workflow blindly; inspect the live Prism project and logs.'}
  def checkpoint(state,**extra):
-  journal.update(state=state,**extra);tmp=paths['journal'].with_suffix('.tmp');tmp.write_text(json.dumps(journal,ensure_ascii=False,indent=2),encoding='utf-8');tmp.replace(paths['journal'])
+  journal.update(state=state,elapsed_seconds=round(time.perf_counter()-started,3),**extra);tmp=paths['journal'].with_suffix('.tmp');tmp.write_text(json.dumps(journal,ensure_ascii=False,indent=2),encoding='utf-8');tmp.replace(paths['journal'])
  checkpoint('prepared')
  shutil.copyfile(paths['data'],staged_data)
  commands=['GoTo G 1','Save '+quote(staged_project),'CloseScriptDialog']
@@ -82,7 +84,7 @@ def native_ic20(bridge,output_dir,template_file,points,name='IC20_native'):
  # Exclusive creation prevents races or overwriting a user's file.
  for src,dst in [(staged_project,paths['project']),(staged_graph,paths['graph'])]:
   with src.open('rb') as reader,dst.open('xb') as writer:shutil.copyfileobj(reader,writer)
- audit={'status':'numerical_checks_passed','prism_displayed_relative_ic20_uM':ecf[0],'independent_relative_ic20_uM':fit['effect_concentration'],'effect_definition':'relative 20% inhibition; Prism ECanything F=80','input_concentrations':len(groups),'input_values':len(points),'raw_values_verified':True,'quality_warnings':fit['warnings'],'template_sha256':src_hash,'error_bars':'mean ± SD, as configured in template','zero_concentration':'included in fitting, absent from log-axis graph','remaining':'Inspect exported graph and reopen the saved project before declaring complete.','files':{k:str(v) for k,v in paths.items()}}
+ audit={'status':'numerical_checks_passed','prism_displayed_relative_ic20_uM':ecf[0],'independent_relative_ic20_uM':fit['effect_concentration'],'effect_definition':'relative 20% inhibition; Prism ECanything F=80','input_concentrations':len(groups),'input_values':len(points),'raw_values_verified':True,'quality_warnings':fit['warnings'],'template_sha256':src_hash,'error_bars':'mean ± SD, as configured in template','zero_concentration':'included in fitting, absent from log-axis graph' if 0.0 in groups else 'not present in input','graph_preflight':preflight(points),'remaining':'Inspect exported graph and reopen the saved project before declaring complete.','files':{k:str(v) for k,v in paths.items()}}
  paths['audit'].write_text(json.dumps(audit,ensure_ascii=False,indent=2),encoding='utf-8');checkpoint('numerical_verified_visual_reopen_pending',audit=str(paths['audit']))
  try:
   reopened,_=open_project(bridge,paths['project']);reopened_graph=stage/'reopened.png'
@@ -98,11 +100,12 @@ def native_ic20(bridge,output_dir,template_file,points,name='IC20_native'):
   else:audit['remaining']='Reopened image differs; inspect both exports manually before use.';checkpoint('reopened_image_differs')
   try:
    audit['temporary_project_closed']=close_owned_staging_project(bridge,staged_project)
-   reopened.focus()
+   audit['reopened_result_window_closed']=close_owned_reopened_project(reopened,paths['project'])
   except Exception as e:
-   audit['temporary_project_closed']=False;audit['quality_warnings'].append('Temporary Prism window cleanup requires inspection: '+str(e))
+   audit.setdefault('temporary_project_closed',False);audit['reopened_result_window_closed']=False;audit['quality_warnings'].append('Owned Prism window cleanup requires inspection: '+str(e))
  except Exception as e:
   audit['reopen']={'opened_and_verified':False,'error':str(e)};audit['remaining']='Reopen or export verification failed; inspect the working copy and Prism state before retrying.';checkpoint('reopen_failed',error=str(e))
+ audit['workflow_elapsed_seconds']=round(time.perf_counter()-started,3)
  paths['audit'].write_text(json.dumps(audit,ensure_ascii=False,indent=2),encoding='utf-8')
  return audit
 
@@ -144,6 +147,9 @@ def open_project(base_bridge,project,allow_existing=False):
  while time.monotonic()<deadline:
   matches=[x for x in base_bridge.windows() if x['pid']==base_bridge.pid and x['title'].startswith(asset.name)]
   if len(matches)==1 and base_bridge.u.IsWindowVisible(matches[0]['hwnd']) and base_bridge.u.IsWindowEnabled(matches[0]['hwnd']):return PrismBridge(asset.name,matches[0]['hwnd']),asset
+  if len(matches)==1:
+   opened=PrismBridge(asset.name,matches[0]['hwnd']);dialogs=opened.dialogs()
+   if dialogs:raise RuntimeError(f'Opened project is blocked by dialogs: {[{"hwnd":d["hwnd"],"title":d["title"]} for d in dialogs]}; inspect the new working copy. No batch script was run.')
   if len(matches)>1:raise RuntimeError('More than one template window appeared; inspect Prism.')
   time.sleep(.2)
  raise RuntimeError('Template did not become ready; inspect Prism dialogs before retrying.')
@@ -178,3 +184,23 @@ def close_owned_staging_project(bridge,staged_project):
     handled_save_prompt=True
   time.sleep(.15)
  raise RuntimeError('Staging window did not close; inspect Prism for any save prompt.')
+
+def close_owned_reopened_project(bridge,project_file):
+ """Close only the uniquely reopened saved result created in this workflow; never answer prompts."""
+ import re
+ from ctypes import wintypes as w
+ project=Path(project_file).resolve()
+ if not project.is_file() or not bridge.validate().startswith(project.name+':'):raise RuntimeError('Result project identity is not unique; no window was closed.')
+ if bridge.dialogs() or bridge._script_windows():raise RuntimeError('A Prism dialog is open; result window was not closed.')
+ choices=bridge.find_menu(r'^(?:关闭\s*\(&[A-Za-z]\)|Close\s*(?:\(&[A-Za-z]\))?)(?:\s|\t|$)')
+ if len(choices)!=1:raise RuntimeError('Close Project menu is ambiguous; result window was not closed.')
+ post=bridge.u.PostMessageW;post.argtypes=[w.HWND,w.UINT,w.WPARAM,w.LPARAM];post.restype=w.BOOL
+ if not post(bridge.frame,0x111,choices[0]['id'],0):raise RuntimeError('Could not post Close Project command.')
+ deadline=time.monotonic()+8
+ while time.monotonic()<deadline:
+  if not bridge.u.IsWindow(bridge.frame):return True
+  # Prism can keep its last frame alive as an empty application window.
+  if re.fullmatch(r'GraphPad Prism(?:\s+\d+(?:\.\d+)*(?:\s*\([^)]*\))?)?',bridge.text(bridge.frame).strip(),re.I):return True
+  if bridge.dialogs():raise RuntimeError('A close prompt appeared; inspect it. No prompt was accepted.')
+  time.sleep(.15)
+ raise RuntimeError('Result window did not close; inspect Prism state.')
